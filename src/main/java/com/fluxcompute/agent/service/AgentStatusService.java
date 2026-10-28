@@ -31,6 +31,7 @@ public class AgentStatusService {
             try{
                 synchronized(curr){
                     if(curr.isOpen()){
+                        System.out.println("sending resource stats");
                         ObjectNode response = objectMapper.createObjectNode();
                         ResourceInfo info = resourceMonitoringService.getCurrentResources();
                         response.put("type","RESOURCE_STATUS");

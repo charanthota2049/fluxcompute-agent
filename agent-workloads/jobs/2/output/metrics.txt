@@ -1,0 +1,3 @@
+dataset=Iris
+ test_accuracy=0.9000
+ test_samples=30

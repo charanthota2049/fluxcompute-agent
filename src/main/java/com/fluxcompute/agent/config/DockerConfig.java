@@ -18,7 +18,7 @@ public class DockerConfig {
 
         DefaultDockerClientConfig dockerConfig =
                 DefaultDockerClientConfig.createDefaultConfigBuilder()
-                        .withDockerHost("npipe:////./pipe/dockerDesktopLinuxEngine")
+                        .withDockerHost("unix:///var/run/docker.sock")
                         .build();
         System.out.println("Docker host: " + dockerConfig.getDockerHost());
 

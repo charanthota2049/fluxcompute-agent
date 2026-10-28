@@ -1,111 +1,206 @@
+
 package com.fluxcompute.agent.service;
 
-
-import com.fluxcompute.agent.AgentApplication;
-
-import java.nio.charset.StandardCharsets;
-
-import org.springframework.stereotype.Service;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.CreateContainerResponse;
-import com.github.dockerjava.api.exception.NotFoundException;
-import com.github.dockerjava.api.model.*;
+import com.github.dockerjava.api.model.AccessMode;
+import com.github.dockerjava.api.model.Bind;
+import com.github.dockerjava.api.model.Capability;
+import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.Volume;
+import org.springframework.stereotype.Service;
 
-@Service 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+@Service
 public class DockerExecutionService {
-    
-    private final AgentApplication agentApplication;
+
+    private static final String IMAGE = "fluxcompute-python-ml:1.0";
+    private static final long MEMORY_BYTES = 512L * 1024 * 1024;
+    private static final long CPU_NANOS = 1_000_000_000L;
+    private static final long TIMEOUT_MINUTES = 10;
+    private static final int MAX_LOG_CHARS = 1_000_000;
+
     private final DockerClient dockerClient;
 
-    public DockerExecutionService(DockerClient dockerClient, AgentApplication agentApplication){
+    public DockerExecutionService(DockerClient dockerClient) {
         this.dockerClient = dockerClient;
-        this.agentApplication = agentApplication;
     }
 
-    public String test(){
-        var info = dockerClient.infoCmd().exec();
-        String s="Docker containers:"+info.getContainers();
-        return s;
+    public String test() {
+        return "Docker containers: "
+                + dockerClient.infoCmd().exec().getContainers();
     }
 
-    public String executeMLWorklad(String workloadpath){
-        // String imageName = "python:3.12";
+    public String executeMLWorklad(String workloadPath) {
+        String containerId = null;
+        boolean timedOut = false;
 
-        // try{
-        //     dockerClient.inspectImageCmd(imageName)
-        //                 .exec();    
-        // }
-        // catch(NotFoundException e){
-        //     System.out.println("image not found. Pulling "+imageName);
+        try {
+            Path workspace = Path.of(workloadPath)
+                    .toAbsolutePath()
+                    .normalize();
 
-        // }
-        
-        System.out.println("Starting ML workload");
-        
-        HostConfig hostConfig = new HostConfig();
-        System.out.println("Workload path received: " + workloadpath);
-        hostConfig.withBinds(new Bind(workloadpath,new Volume("/workspace")));
+            if (!Files.isDirectory(workspace)) {
+                throw new IllegalArgumentException(
+                        "Workspace directory does not exist: " + workspace);
+            }
 
-        CreateContainerResponse container = dockerClient
-                                                        .createContainerCmd("python:3.12")
-                                                        .withHostConfig(hostConfig)
-                                                        .withCmd(
-                                                            "sh",
-                                                            "-c",
-                                                            "pip install -r /workspace/requirements.txt"
-                                                            + " && "
-                                                            + "python /workspace/train.py"
-                                                        )
-                                                        .exec();
-        String containerId = container.getId();
-        System.out.println("Container created "+containerId);
-        
-        dockerClient.startContainerCmd(containerId).exec();
-        
-        System.out.println("Container created "+containerId);
-        
-        var waitResponse = dockerClient
-                                    .waitContainerCmd(containerId)
+            if (!Files.isRegularFile(workspace.resolve("train.py"))) {
+                throw new IllegalArgumentException(
+                        "Workspace must contain train.py");
+            }
+            
+            Path jobDirectory = workspace.getParent();
+            Path outputDir = jobDirectory.resolve("output");
+
+            HostConfig hostConfig = new HostConfig()
+                    .withBinds(
+                                new Bind(
+                                    workspace.toString(),
+                                    new Volume("/workspace"),
+                                    AccessMode.ro
+                                ),
+                                new Bind(
+                                    outputDir.toString(),
+                                    new Volume("/output"),
+                                    AccessMode.rw
+                                )
+                            )
+                    .withNetworkMode("none")
+                    .withReadonlyRootfs(true)
+                    .withCapDrop(Capability.ALL)
+                    .withSecurityOpts(List.of("no-new-privileges:true"))
+                    .withMemory(MEMORY_BYTES)
+                    .withMemorySwap(MEMORY_BYTES)
+                    .withNanoCPUs(CPU_NANOS)
+                    .withPidsLimit(128L)
+                    .withTmpFs(Map.of(
+                            "/tmp", "rw,noexec,nosuid,size=64m"));
+
+            CreateContainerResponse container = dockerClient
+                    .createContainerCmd(IMAGE)
+                    .withUser("1000:1000")
+                    .withWorkingDir("/workspace")
+                    .withReadonlyRootfs(true)
+                    .withHostConfig(hostConfig)
+                    .withEnv(
+                            "PIP_NO_CACHE_DIR=1",
+                            "PYTHONDONTWRITEBYTECODE=1")
+                    .withCmd("python", "/workspace/train.py")
+                    .exec();
+
+            containerId = container.getId();
+            System.out.println("Sandbox container created: " + containerId);
+
+            dockerClient.startContainerCmd(containerId).exec();
+
+            final String runningContainerId = containerId;
+
+            CompletableFuture<Integer> waitFuture =
+                    CompletableFuture.supplyAsync(() ->
+                            dockerClient.waitContainerCmd(runningContainerId)
                                     .start()
-                                    .awaitStatusCode();
-        
-        System.out.println("Container finished with exit code "+waitResponse);
+                                    .awaitStatusCode());
 
-        String logs = getContainerLogs(containerId);
+            int exitCode;
 
-        return logs;
+            try {
+                exitCode = waitFuture.get(
+                        TIMEOUT_MINUTES, TimeUnit.MINUTES);
+            } catch (TimeoutException e) {
+                timedOut = true;
+
+                try {
+                    dockerClient.stopContainerCmd(containerId)
+                            .withTimeout(5)
+                            .exec();
+                } catch (Exception stopError) {
+                    System.err.println(
+                            "Could not stop timed-out container: "
+                                    + stopError.getMessage());
+                }
+
+                throw new RuntimeException(
+                        "Workload exceeded its execution timeout", e);
+            }
+
+            String logs = getContainerLogs(containerId);
+
+            System.out.println("Sandbox exit code: " + exitCode);
+            System.out.println(logs);
+
+            if (exitCode != 0) {
+                throw new RuntimeException(
+                        "Workload failed with exit code "
+                                + exitCode + ". Logs: " + logs);
+            }
+
+            return logs;
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Workload execution interrupted", e);
+        } catch (Exception e) {
+            e.printStackTrace();
+            throw new RuntimeException(
+                    "Sandbox execution failed: " + e.getMessage(), e);
+        } finally {
+            if (containerId != null) {
+                try {
+                    dockerClient.removeContainerCmd(containerId)
+                            .withForce(true)
+                            .exec();
+                } catch (Exception cleanupError) {
+                    System.err.println(
+                            "Container cleanup failed: "
+                                    + cleanupError.getMessage());
+                }
+            }
+        }
     }
 
-    private String getContainerLogs(String containerId){
+    private String getContainerLogs(String containerId) {
         StringBuilder logs = new StringBuilder();
 
-        try{
+        try {
             dockerClient.logContainerCmd(containerId)
-                        .withStdErr(true)
-                        .withStdOut(true)
-                        .withFollowStream(false)
-                        .exec(
-                            new ResultCallback.Adapter<Frame>(){
+                    .withStdOut(true)
+                    .withStdErr(true)
+                    .withFollowStream(false)
+                    .exec(new ResultCallback.Adapter<Frame>() {
+                        @Override
+                        public void onNext(Frame frame) {
+                            byte[] payload = frame.getPayload();
 
-                                @Override 
-                                public void onNext(Frame frame){
-                                    logs.append(
-                                        new String(
-                                            frame.getPayload(),
-                                            StandardCharsets.UTF_8
-                                        )
-                                    );
-                                }
+                            int remaining = MAX_LOG_CHARS - logs.length();
+                            if (remaining > 0) {
+                                logs.append(new String(
+                                        payload, StandardCharsets.UTF_8),
+                                        0,
+                                        Math.min(
+                                                remaining,
+                                                new String(
+                                                        payload,
+                                                        StandardCharsets.UTF_8)
+                                                        .length()));
                             }
-                        )
-                        .awaitCompletion();
-                        
-        }
-        catch(InterruptedException e){
-            Thread.currentThread().interrupt();
+                        }
+                    })
+                    .awaitCompletion();
 
-            throw new RuntimeException("Interrupted while reading container logs");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while reading logs", e);
         }
 
         return logs.toString();
