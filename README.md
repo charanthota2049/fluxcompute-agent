@@ -410,7 +410,7 @@ For a production deployment:
 
 FluxCompute Agent is a component of the larger FluxCompute distributed computing platform.
 
-**Main Platform:** `<FLUXCOMPUTE_REPOSITORY_URL>`
+**Main Platform:** `https://github.com/charanthota2049/fluxCompute`
 
 **Resource Agent:** This repository.
 
